@@ -8,3 +8,4 @@ pdfminer.six
 pytesseract
 python-multipart
 python-dotenv
+PyPDF2
