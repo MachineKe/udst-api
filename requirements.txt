@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pymysql
+pdfplumber
+pymupdf
+pdfminer.six
+pytesseract
+python-multipart
+python-dotenv
