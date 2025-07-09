@@ -52,6 +52,19 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"Error extracting text from {file.filename} with PyPDF2: {e}")
 
+        # Extract tables using pdfplumber (regardless of OCR/text extraction)
+        tables = []
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    page_tables = page.extract_tables()
+                    for table in page_tables:
+                        # Convert table to a list of rows (each row is a list of cell values)
+                        tables.append(table)
+        except Exception as e:
+            print(f"Table extraction failed for {file.filename}: {e}")
+
         # Fallback to OCR with EasyOCR if PyPDF2 fails or returns no text
         if not extracted_text:
             try:
@@ -90,7 +103,7 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
                 "creationDate": datetime.utcnow().isoformat(),
                 "modificationDate": datetime.utcnow().isoformat(),
             },
-            "tables": [],
+            "tables": tables,
             "images": [],
             "structure": {
                 "headings": [],
@@ -134,7 +147,64 @@ async def compare_documents(doc1_id: str, doc2_id: str):
 
     differences = compare_dicts(doc1, doc2)
 
-    # Calculate similarity score as percent of matching fields
+    # --- Extracted Text Similarity and Diff ---
+    import difflib
+    text1 = doc1.get("extractedText", "") or ""
+    text2 = doc2.get("extractedText", "") or ""
+    seq = difflib.SequenceMatcher(None, text1, text2)
+    text_similarity = seq.ratio()
+    text_diff = list(difflib.unified_diff(
+        text1.splitlines(), text2.splitlines(),
+        fromfile="doc1", tofile="doc2", lineterm=""
+    ))
+    differences.append({
+        "field": "extractedText",
+        "similarity": text_similarity,
+        "diff": text_diff[:200],  # Limit diff lines for response size
+    })
+
+    # --- Table Comparison ---
+    tables1 = doc1.get("tables", [])
+    tables2 = doc2.get("tables", [])
+    table_diffs = []
+    min_len = min(len(tables1), len(tables2))
+    for i in range(min_len):
+        t1 = tables1[i]
+        t2 = tables2[i]
+        # Compare as string for simplicity; could use more advanced logic
+        t1_str = "\n".join([",".join([str(cell) for cell in row]) for row in t1])
+        t2_str = "\n".join([",".join([str(cell) for cell in row]) for row in t2])
+        if t1_str != t2_str:
+            diff = list(difflib.unified_diff(
+                t1_str.splitlines(), t2_str.splitlines(),
+                fromfile=f"doc1_table_{i+1}", tofile=f"doc2_table_{i+1}", lineterm=""
+            ))
+            table_diffs.append({
+                "tableIndex": i + 1,
+                "diff": diff[:100],  # Limit diff lines for response size
+            })
+    # Check for extra tables in either doc
+    if len(tables1) > min_len:
+        for i in range(min_len, len(tables1)):
+            table_diffs.append({
+                "tableIndex": i + 1,
+                "onlyIn": "doc1",
+                "table": tables1[i],
+            })
+    if len(tables2) > min_len:
+        for i in range(min_len, len(tables2)):
+            table_diffs.append({
+                "tableIndex": i + 1,
+                "onlyIn": "doc2",
+                "table": tables2[i],
+            })
+    if table_diffs:
+        differences.append({
+            "field": "tables",
+            "tableDiffs": table_diffs,
+        })
+
+    # Calculate similarity score as percent of matching fields (excluding text similarity)
     total_fields = len(differences) + 1  # +1 to avoid division by zero
     similarity_score = 1.0 - (len(differences) / total_fields)
 
@@ -143,11 +213,13 @@ async def compare_documents(doc1_id: str, doc2_id: str):
         f"Found {len(differences)} differing field(s)."
         if differences else "Documents are identical."
     )
+    summary += f" Extracted text similarity: {(text_similarity * 100):.1f}%."
 
     comparison_result = {
         "doc1Id": doc1_id,
         "doc2Id": doc2_id,
         "similarityScore": similarity_score,
+        "textSimilarity": text_similarity,
         "differences": differences,
         "summary": summary,
     }
