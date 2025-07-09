@@ -6,6 +6,7 @@ pdfplumber
 pymupdf
 pdfminer.six
 pytesseract
+easyocr
 python-multipart
 python-dotenv
 PyPDF2

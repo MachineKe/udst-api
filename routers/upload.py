@@ -52,19 +52,23 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"Error extracting text from {file.filename} with PyPDF2: {e}")
 
-        # Fallback to OCR if PyPDF2 fails or returns no text
+        # Fallback to OCR with EasyOCR if PyPDF2 fails or returns no text
         if not extracted_text:
             try:
                 import pdfplumber
-                import pytesseract
+                import easyocr
+                reader = easyocr.Reader(['en'])
                 with pdfplumber.open(file_path) as pdf:
                     for page in pdf.pages:
                         img = page.to_image(resolution=300)
-                        text = pytesseract.image_to_string(img.original)
-                        extracted_text += text
-                print(f"Extracted text length for {file.filename} (OCR): {len(extracted_text)}")
+                        # Convert PIL image to numpy array for EasyOCR
+                        np_image = img.original
+                        # EasyOCR expects numpy array or file path
+                        result = reader.readtext(np_image, detail=0, paragraph=True)
+                        extracted_text += "\n".join(result) + "\n"
+                print(f"Extracted text length for {file.filename} (EasyOCR): {len(extracted_text)}")
             except Exception as e:
-                print(f"OCR extraction failed for {file.filename}: {e}")
+                print(f"OCR extraction failed for {file.filename} (EasyOCR): {e}")
 
         doc_id = str(uuid.uuid4())
         extracted_doc = {
