@@ -57,14 +57,18 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             try:
                 import pdfplumber
                 import easyocr
-                reader = easyocr.Reader(['en'])
+                ocr_reader = easyocr.Reader(['en'])
                 with pdfplumber.open(file_path) as pdf:
-                    for page in pdf.pages:
-                        img = page.to_image(resolution=300)
-                        # Convert PIL image to numpy array for EasyOCR
-                        np_image = img.original
-                        # EasyOCR expects numpy array or file path
-                        result = reader.readtext(np_image, detail=0, paragraph=True)
+                    max_pages = 3  # Limit to first 3 pages for speed
+                    for i, page in enumerate(pdf.pages):
+                        if i >= max_pages:
+                            print(f"Skipping OCR for page {i+1} and beyond (limit set to {max_pages} pages).")
+                            break
+                        print(f"Running EasyOCR on page {i+1} of {min(len(pdf.pages), max_pages)}...")
+                        img = page.to_image(resolution=200)  # Lower resolution for speed
+                        import numpy as np
+                        np_image = np.array(img.original)
+                        result = ocr_reader.readtext(np_image, detail=0, paragraph=True)
                         extracted_text += "\n".join(result) + "\n"
                 print(f"Extracted text length for {file.filename} (EasyOCR): {len(extracted_text)}")
             except Exception as e:
