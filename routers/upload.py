@@ -25,6 +25,16 @@ async def list_uploaded_documents():
                 docs.append(doc)
     return {"documents": docs}
 
+@router.get("/{doc_id}")
+async def get_document_by_id(doc_id: str):
+    # Return the extracted data for a single document by ID
+    doc_path = os.path.join(UPLOAD_DIR, f"{doc_id}.json")
+    if not os.path.exists(doc_path):
+        raise HTTPException(status_code=404, detail="Document not found.")
+    with open(doc_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    return {"document": doc}
+
 @router.post("/")
 async def upload_pdfs(files: List[UploadFile] = File(...)):
     import PyPDF2
@@ -167,36 +177,101 @@ async def compare_documents(doc1_id: str, doc2_id: str):
     tables1 = doc1.get("tables", [])
     tables2 = doc2.get("tables", [])
     table_diffs = []
-    min_len = min(len(tables1), len(tables2))
-    for i in range(min_len):
-        t1 = tables1[i]
-        t2 = tables2[i]
-        # Compare as string for simplicity; could use more advanced logic
-        t1_str = "\n".join([",".join([str(cell) for cell in row]) for row in t1])
-        t2_str = "\n".join([",".join([str(cell) for cell in row]) for row in t2])
-        if t1_str != t2_str:
-            diff = list(difflib.unified_diff(
-                t1_str.splitlines(), t2_str.splitlines(),
-                fromfile=f"doc1_table_{i+1}", tofile=f"doc2_table_{i+1}", lineterm=""
-            ))
+    used_doc2 = set()
+
+    def table_header(table):
+        # Use first row as header, fallback to empty tuple
+        return tuple(str(cell).strip().lower() for cell in table[0]) if table and len(table) > 0 else tuple()
+
+    def table_similarity(t1, t2):
+        # Compare headers, then content similarity (Jaccard index of rows)
+        h1, h2 = table_header(t1), table_header(t2)
+        if not h1 or not h2:
+            return 0
+        header_score = len(set(h1) & set(h2)) / max(len(h1), len(h2))
+        # Compare row sets (excluding header)
+        rows1 = set(tuple(str(cell).strip().lower() for cell in row) for row in t1[1:])
+        rows2 = set(tuple(str(cell).strip().lower() for cell in row) for row in t2[1:])
+        row_score = len(rows1 & rows2) / max(1, len(rows1 | rows2))
+        return 0.7 * header_score + 0.3 * row_score
+
+    # Match tables by header/content similarity
+    for i, t1 in enumerate(tables1):
+        best_score = 0
+        best_j = None
+        for j, t2 in enumerate(tables2):
+            if j in used_doc2:
+                continue
+            score = table_similarity(t1, t2)
+            if score > best_score:
+                best_score = score
+                best_j = j
+        if best_score > 0.5 and best_j is not None:
+            # Consider as matched tables
+            used_doc2.add(best_j)
+            t2 = tables2[best_j]
+            # Normalize: compare headers, then sets of rows (excluding header)
+            h1, h2 = table_header(t1), table_header(t2)
+            rows1 = [tuple(str(cell).strip().lower() for cell in row) for row in t1[1:]]
+            rows2 = [tuple(str(cell).strip().lower() for cell in row) for row in t2[1:]]
+            # Flatten all cell values for content similarity
+            def flatten_cells(table):
+                return set(str(cell).strip().lower() for row in table for cell in row)
+            flat1 = flatten_cells(t1)
+            flat2 = flatten_cells(t2)
+            overlap = len(flat1 & flat2)
+            total = max(1, len(flat1 | flat2))
+            content_similarity = overlap / total
+            if h1 == h2 and set(rows1) == set(rows2):
+                # Content equivalent, even if order differs
+                table_diffs.append({
+                    "tableIndexDoc1": i + 1,
+                    "tableIndexDoc2": best_j + 1,
+                    "header": list(h1),
+                    "contentEquivalent": True,
+                    "table": t1,
+                })
+            elif content_similarity > 0.7:
+                # Similar content, different structure
+                table_diffs.append({
+                    "tableIndexDoc1": i + 1,
+                    "tableIndexDoc2": best_j + 1,
+                    "header1": list(h1),
+                    "header2": list(h2),
+                    "similarContent": True,
+                    "similarityScore": round(content_similarity, 2),
+                    "table1": t1,
+                    "table2": t2,
+                })
+            else:
+                t1_str = "\n".join([",".join([str(cell) for cell in row]) for row in t1])
+                t2_str = "\n".join([",".join([str(cell) for cell in row]) for row in t2])
+                diff = list(difflib.unified_diff(
+                    t1_str.splitlines(), t2_str.splitlines(),
+                    fromfile=f"doc1_table_{i+1}", tofile=f"doc2_table_{best_j+1}", lineterm=""
+                ))
+                table_diffs.append({
+                    "tableIndexDoc1": i + 1,
+                    "tableIndexDoc2": best_j + 1,
+                    "header": list(h1),
+                    "diff": diff[:100],  # Limit diff lines for response size
+                })
+        else:
+            # No match found in doc2
             table_diffs.append({
-                "tableIndex": i + 1,
-                "diff": diff[:100],  # Limit diff lines for response size
-            })
-    # Check for extra tables in either doc
-    if len(tables1) > min_len:
-        for i in range(min_len, len(tables1)):
-            table_diffs.append({
-                "tableIndex": i + 1,
+                "tableIndexDoc1": i + 1,
                 "onlyIn": "doc1",
-                "table": tables1[i],
+                "header": list(table_header(t1)),
+                "table": t1,
             })
-    if len(tables2) > min_len:
-        for i in range(min_len, len(tables2)):
+    # Any tables in doc2 not matched
+    for j, t2 in enumerate(tables2):
+        if j not in used_doc2:
             table_diffs.append({
-                "tableIndex": i + 1,
+                "tableIndexDoc2": j + 1,
                 "onlyIn": "doc2",
-                "table": tables2[i],
+                "header": list(table_header(t2)),
+                "table": t2,
             })
     if table_diffs:
         differences.append({
