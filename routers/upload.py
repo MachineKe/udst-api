@@ -84,14 +84,82 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
                 with pdfplumber.open(file_path) as pdf:
                     for i, page in enumerate(pdf.pages):
                         print(f"Running EasyOCR on page {i+1} of {len(pdf.pages)}...")
-                        img = page.to_image(resolution=200)  # Lower resolution for speed
+                        img = page.to_image(resolution=200)
                         import numpy as np
                         np_image = np.array(img.original)
-                        result = ocr_reader.readtext(np_image, detail=0, paragraph=True)
-                        extracted_text += "\n".join(result) + "\n"
+                        # Use detail=1 to get bounding box data
+                        ocr_results = ocr_reader.readtext(np_image, detail=1, paragraph=False)
+                        # Group words by line (y coordinate)
+                        from collections import defaultdict
+                        line_dict = defaultdict(list)
+                        for bbox, text, conf in ocr_results:
+                            # bbox: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+                            y_center = (bbox[0][1] + bbox[2][1]) / 2
+                            line_dict[round(y_center, 0)].append((bbox[0][0], text))
+                        # Sort lines by y, then words by x
+                        for y in sorted(line_dict.keys()):
+                            words = sorted(line_dict[y], key=lambda x: x[0])
+                            # Insert enough spaces between words to simulate columns
+                            line = ""
+                            prev_x = None
+                            for x, word in words:
+                                if prev_x is not None:
+                                    # Add spaces proportional to distance between words
+                                    gap = int((x - prev_x) // 15)
+                                    line += " " * max(1, gap)
+                                line += word
+                                prev_x = x + len(word) * 10  # crude estimate of word width
+                            extracted_text += line + "\n"
                 print(f"Extracted text length for {file.filename} (EasyOCR): {len(extracted_text)}")
             except Exception as e:
                 print(f"OCR extraction failed for {file.filename} (EasyOCR): {e}")
+
+        # Always attempt to extract tables from extracted_text and merge with any found tables
+        if extracted_text:
+            def parse_tables_from_text(text):
+                import re
+                lines = [line for line in text.splitlines() if line.strip()]
+                tables_from_text = []
+                current_table = []
+                col_counts = []
+                for line in lines:
+                    # Try splitting by 2+ spaces or tab
+                    cells = re.split(r"\s{2,}|\t", line.strip())
+                    # If not enough columns, try splitting by single space
+                    if len(cells) <= 1:
+                        cells = [c for c in line.strip().split(" ") if c]
+                    # If still not enough, try splitting by comma
+                    if len(cells) <= 1 and "," in line:
+                        cells = [c.strip() for c in line.split(",")]
+                    # Heuristic: consider as table row if 2+ columns and at least one cell is not empty
+                    if len(cells) > 1 and any(cell.strip() for cell in cells):
+                        col_counts.append(len(cells))
+                        # If previous rows had a different column count, allow for some raggedness (tolerance of 1)
+                        if current_table:
+                            prev_cols = max(set(col_counts[-3:]), key=col_counts[-3:].count) if len(col_counts) >= 3 else col_counts[-1]
+                            if abs(len(cells) - prev_cols) > 1:
+                                if len(current_table) > 1:
+                                    tables_from_text.append(current_table)
+                                current_table = []
+                                col_counts = [len(cells)]
+                        current_table.append(cells)
+                    else:
+                        if current_table:
+                            if len(current_table) > 1:
+                                tables_from_text.append(current_table)
+                            current_table = []
+                            col_counts = []
+                if current_table and len(current_table) > 1:
+                    tables_from_text.append(current_table)
+                return tables_from_text
+            tables_from_text = parse_tables_from_text(extracted_text)
+            # Merge: only add tables that are not already present (by header row)
+            def table_header(table):
+                return tuple(str(cell).strip().lower() for cell in table[0]) if table and len(table) > 0 else tuple()
+            existing_headers = {table_header(t) for t in tables}
+            for t in tables_from_text:
+                if table_header(t) not in existing_headers:
+                    tables.append(t)
 
         doc_id = str(uuid.uuid4())
         extracted_doc = {
@@ -174,8 +242,66 @@ async def compare_documents(doc1_id: str, doc2_id: str):
     })
 
     # --- Table Comparison ---
-    tables1 = doc1.get("tables", [])
-    tables2 = doc2.get("tables", [])
+    def parse_tables_from_text(text):
+        import re
+        lines = [line for line in text.splitlines() if line.strip()]
+        tables_from_text = []
+        current_table = []
+        last_col_count = None
+        for line in lines:
+            cells = re.split(r"\s{2,}|\t", line.strip())
+            if len(cells) > 1 and any(cell.strip() for cell in cells):
+                if last_col_count is not None and len(cells) != last_col_count and current_table:
+                    if len(current_table) > 1:
+                        tables_from_text.append(current_table)
+                    current_table = []
+                current_table.append(cells)
+                last_col_count = len(cells)
+            else:
+                if current_table:
+                    if len(current_table) > 1:
+                        tables_from_text.append(current_table)
+                    current_table = []
+                last_col_count = None
+        if current_table and len(current_table) > 1:
+            tables_from_text.append(current_table)
+        return tables_from_text
+
+    tables1 = doc1.get("tables") if "tables" in doc1 else []
+    doc1_tables_fallback = False
+    extracted_text1 = doc1.get("extractedText", "")
+    print(f"[COMPARE] doc1 tables: {tables1} (type: {type(tables1)}), extractedText length: {len(extracted_text1)}")
+    if (not tables1 or (isinstance(tables1, list) and len(tables1) == 0)):
+        if extracted_text1 and extracted_text1.strip():
+            print(f"[COMPARE] Fallback: extracting tables from extractedText for doc1 ({doc1.get('id', 'unknown')})")
+            tables1 = parse_tables_from_text(extracted_text1)
+            print(f"[COMPARE] Extracted {len(tables1)} tables for doc1 fallback")
+            doc1["tables"] = tables1
+            doc1_tables_fallback = True
+        else:
+            print(f"[COMPARE] Skipping fallback for doc1: extractedText is empty or whitespace")
+    tables2 = doc2.get("tables") if "tables" in doc2 else []
+    doc2_tables_fallback = False
+    extracted_text2 = doc2.get("extractedText", "")
+    print(f"[COMPARE] doc2 tables: {tables2} (type: {type(tables2)}), extractedText length: {len(extracted_text2)}")
+    if (not tables2 or (isinstance(tables2, list) and len(tables2) == 0)):
+        if extracted_text2 and extracted_text2.strip():
+            print(f"[COMPARE] Fallback: extracting tables from extractedText for doc2 ({doc2.get('id', 'unknown')})")
+            tables2 = parse_tables_from_text(extracted_text2)
+            print(f"[COMPARE] Extracted {len(tables2)} tables for doc2 fallback")
+            doc2["tables"] = tables2
+            doc2_tables_fallback = True
+        else:
+            print(f"[COMPARE] Skipping fallback for doc2: extractedText is empty or whitespace")
+
+    # Persist fallback tables if extracted
+    if doc1_tables_fallback:
+        with open(doc1_path, "w", encoding="utf-8") as f1:
+            json.dump(doc1, f1, ensure_ascii=False, indent=2)
+    if doc2_tables_fallback:
+        with open(doc2_path, "w", encoding="utf-8") as f2:
+            json.dump(doc2, f2, ensure_ascii=False, indent=2)
+
     table_diffs = []
     used_doc2 = set()
 
